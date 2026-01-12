@@ -25,6 +25,19 @@ import type { NwcSubAccount } from "./utils/nwc-store";
 import type { SubAccountInvoice } from "./utils/nwc-store";
 import type { Transaction } from "applesauce-wallet-connect/helpers";
 import { parseBolt11 } from "applesauce-core/helpers";
+import {
+  initStorage,
+  createProduct,
+  getProductById,
+  listProducts,
+  updateProduct,
+  createOrder,
+  getOrderById,
+  getOrderByPaymentHash,
+  updateOrderStatus,
+  listOrders,
+} from "./utils/storage";
+import type { ProductRecord, OrderRecord, CreateProductParams } from "./utils/storage";
 
 function createWallet(uri: string): WalletConnect {
   const parsed = parseWalletConnectURI(uri);
@@ -124,6 +137,20 @@ function processIncomingTransaction(nickname: string, tx: Transaction): string |
   const settlement = applyIncomingTransaction(entry, tx);
   if (!settlement.matched || !settlement.subAccountId || !settlement.invoice) return null;
   saveNwcStore(store);
+
+  // Check for merchant order settlement
+  if (tx.payment_hash) {
+    try {
+      const order = getOrderByPaymentHash(tx.payment_hash);
+      if (order && order.status === "pending") {
+        updateOrderStatus(order.id, "paid", new Date().toISOString());
+        console.log(`[merchant] Order ${order.id} marked as paid`);
+      }
+    } catch (e) {
+      // Storage may not be initialized, ignore
+    }
+  }
+
   const credited = settlement.creditedMsats ?? 0;
   if (credited > 0) {
     return `Credited ${credited} msats to ${formatSubAccountIdentifier(nickname, settlement.subAccountId)}`;
@@ -510,10 +537,235 @@ async function handle(req: Request): Promise<Response> {
       return json(200, { data: res.data, context: res.context });
     }
 
+    // ==========================================
+    // MERCHANT PRODUCT ENDPOINTS
+    // ==========================================
+
+    // GET /api/products?nickname=<wallet_nickname>
+    if (path === "/api/products" && req.method === "GET") {
+      const nickname = url.searchParams.get("nickname");
+      if (!nickname) return json(400, { error: "Missing nickname query parameter" });
+      try {
+        const products = listProducts(nickname);
+        return json(200, { products });
+      } catch (e: any) {
+        return json(500, { error: e?.message || String(e) });
+      }
+    }
+
+    // GET /api/products/:id
+    if (pathParts[0] === "api" && pathParts[1] === "products" && pathParts.length === 3 && req.method === "GET") {
+      const productId = pathParts[2];
+      try {
+        const product = getProductById(productId);
+        if (!product) return json(404, { error: "Product not found" });
+        return json(200, { product });
+      } catch (e: any) {
+        return json(500, { error: e?.message || String(e) });
+      }
+    }
+
+    // POST /api/products (create product)
+    if (path === "/api/products" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const { nickname, name, priceSats, description, metadata } = body as {
+        nickname?: string;
+        name?: string;
+        priceSats?: number;
+        description?: string;
+        metadata?: Record<string, unknown>;
+      };
+      if (!nickname || !name || typeof priceSats !== "number") {
+        return json(400, { error: "Missing nickname, name, or priceSats" });
+      }
+      if (priceSats <= 0) {
+        return json(400, { error: "priceSats must be positive" });
+      }
+      try {
+        const product = createProduct({
+          walletNickname: nickname,
+          name,
+          priceSats: Math.floor(priceSats),
+          description,
+          metadata,
+        });
+        return json(201, { product });
+      } catch (e: any) {
+        return json(500, { error: e?.message || String(e) });
+      }
+    }
+
+    // ==========================================
+    // MERCHANT ORDER ENDPOINTS
+    // ==========================================
+
+    // POST /api/orders (create order + invoice)
+    if (path === "/api/orders" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const { product_id, quantity, metadata } = body as {
+        product_id?: string;
+        quantity?: number;
+        metadata?: Record<string, unknown>;
+      };
+      if (!product_id || typeof quantity !== "number" || quantity <= 0) {
+        return json(400, { error: "Missing product_id or invalid quantity" });
+      }
+
+      // Get product
+      let product: ProductRecord | undefined;
+      try {
+        product = getProductById(product_id);
+      } catch (e: any) {
+        return json(500, { error: `Storage error: ${e?.message || String(e)}` });
+      }
+      if (!product) {
+        return json(404, { error: "Product not found" });
+      }
+      if (!product.active) {
+        return json(400, { error: "Product is not active" });
+      }
+
+      const totalSats = product.priceSats * Math.floor(quantity);
+      const description = `${quantity}x ${product.name}`;
+
+      // Create invoice via wallet
+      const res = await withWallet(product.walletNickname, async (wallet, support, resolved, store, markMutated) => {
+        if (!supportsMethod(support, "make_invoice")) {
+          throw new Error("make_invoice not supported");
+        }
+        const invoiceResult = await withTimeout(
+          wallet.makeInvoice(totalSats * MSATS_PER_SAT, { description }),
+          20000,
+          "make_invoice"
+        );
+
+        // Register pending invoice for sub-account settlement (optional)
+        if (resolved.subAccountId) {
+          registerPendingInvoice(resolved.entry, resolved.subAccountId, {
+            invoice: invoiceResult.invoice,
+            paymentHash: invoiceResult.payment_hash,
+            amountMsats: totalSats * MSATS_PER_SAT,
+          });
+          markMutated();
+        }
+
+        // Create order in database
+        const order = createOrder({
+          walletNickname: product!.walletNickname,
+          productId: product_id,
+          quantity: Math.floor(quantity),
+          totalSats,
+          invoice: invoiceResult.invoice,
+          paymentHash: invoiceResult.payment_hash,
+          expiresAt: invoiceResult.expires_at,
+          metadata,
+        });
+
+        return {
+          order_id: order.id,
+          invoice: invoiceResult.invoice,
+          amount_sats: totalSats,
+          status: order.status,
+          expires_at: invoiceResult.expires_at,
+          product_name: product!.name,
+        };
+      });
+
+      return json(201, res);
+    }
+
+    // GET /api/orders/:id/status
+    if (
+      pathParts[0] === "api" &&
+      pathParts[1] === "orders" &&
+      pathParts.length === 4 &&
+      pathParts[3] === "status" &&
+      req.method === "GET"
+    ) {
+      const orderId = pathParts[2];
+      try {
+        const order = getOrderById(orderId);
+        if (!order) return json(404, { error: "Order not found" });
+
+        // If pending, try to check with the wallet
+        if (order.status === "pending" && order.paymentHash) {
+          try {
+            const store = loadNwcStore();
+            const entry = store[order.walletNickname];
+            if (entry) {
+              const wallet = createWallet(entry.uri);
+              try {
+                const lookup = await withTimeout(
+                  wallet.lookupInvoice(order.paymentHash, order.invoice),
+                  10000,
+                  "lookup_invoice"
+                );
+                if (lookup?.state === "settled") {
+                  updateOrderStatus(order.id, "paid", new Date().toISOString());
+                  order.status = "paid";
+                  order.paidAt = new Date().toISOString();
+                }
+              } finally {
+                try { (wallet as any)?.stop?.(); } catch {}
+              }
+            }
+          } catch (e) {
+            // Lookup failed, return current status
+          }
+        }
+
+        // Check expiry
+        if (order.status === "pending" && order.expiresAt) {
+          const now = Math.floor(Date.now() / 1000);
+          if (order.expiresAt < now) {
+            updateOrderStatus(order.id, "expired");
+            order.status = "expired";
+          }
+        }
+
+        const product = getProductById(order.productId);
+
+        return json(200, {
+          order_id: order.id,
+          status: order.status,
+          paid_at: order.paidAt || null,
+          amount_sats: order.totalSats,
+          quantity: order.quantity,
+          product_id: order.productId,
+          product_name: product?.name || null,
+        });
+      } catch (e: any) {
+        return json(500, { error: e?.message || String(e) });
+      }
+    }
+
+    // GET /api/orders?nickname=<wallet_nickname>&status=<optional>
+    if (path === "/api/orders" && req.method === "GET") {
+      const nickname = url.searchParams.get("nickname");
+      if (!nickname) return json(400, { error: "Missing nickname query parameter" });
+      const statusFilter = url.searchParams.get("status") as "pending" | "paid" | "expired" | "cancelled" | null;
+      try {
+        const orders = listOrders(nickname, statusFilter || undefined);
+        return json(200, { orders });
+      } catch (e: any) {
+        return json(500, { error: e?.message || String(e) });
+      }
+    }
+
     return json(404, { error: "Not Found" });
   } catch (e: any) {
     return json(500, { error: e?.message || String(e) });
   }
+}
+
+// Initialize SQLite storage for merchant features (products/orders)
+try {
+  if (Bun.env.STORAGE_MASTER_KEY || Bun.env.NWC_STORAGE_KEY) {
+    initStorage();
+    console.log("[merchant] Storage initialized");
+  }
+} catch (e) {
+  console.warn("[merchant] Storage not initialized (set STORAGE_MASTER_KEY to enable):", (e as Error).message);
 }
 
 const server = serve({ port: Bun.env.PORT ? Number(Bun.env.PORT) : 8787, fetch: handle });

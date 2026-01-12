@@ -97,6 +97,56 @@ export interface PendingLookupCriteria {
   descriptionHash?: string | null;
 }
 
+// Merchant types
+export type OrderStatus = "pending" | "paid" | "expired" | "cancelled";
+
+export interface ProductRecord {
+  id: string;
+  walletNickname: string;
+  name: string;
+  priceSats: number;
+  description?: string;
+  active: boolean;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OrderRecord {
+  id: string;
+  walletNickname: string;
+  productId: string;
+  quantity: number;
+  totalSats: number;
+  status: OrderStatus;
+  invoice?: string;
+  paymentHash?: string;
+  expiresAt?: number;
+  paidAt?: string;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateProductParams {
+  walletNickname: string;
+  name: string;
+  priceSats: number;
+  description?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CreateOrderParams {
+  walletNickname: string;
+  productId: string;
+  quantity: number;
+  totalSats: number;
+  invoice: string;
+  paymentHash: string;
+  expiresAt?: number;
+  metadata?: Record<string, unknown>;
+}
+
 let dbPath = DEFAULT_DB_PATH;
 let database: Database | null = null;
 let masterKey: Buffer | null = null;
@@ -244,6 +294,42 @@ function runMigrations(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_pending_sub_account_state ON pending_invoices(sub_account_id, state);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_pending_payment_hash ON pending_invoices(payment_hash);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_pending_invoice ON pending_invoices(invoice);`);
+
+  // Merchant tables
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS products (
+      id TEXT PRIMARY KEY,
+      wallet_nickname TEXT NOT NULL,
+      name TEXT NOT NULL,
+      price_sats INTEGER NOT NULL,
+      description TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      metadata TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_products_wallet ON products(wallet_nickname, active);`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id TEXT PRIMARY KEY,
+      wallet_nickname TEXT NOT NULL,
+      product_id TEXT NOT NULL,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      total_sats INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      invoice TEXT,
+      payment_hash TEXT,
+      expires_at INTEGER,
+      paid_at TEXT,
+      metadata TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_orders_wallet_status ON orders(wallet_nickname, status);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_orders_payment_hash ON orders(payment_hash);`);
 }
 
 function nowISO(): string {
@@ -634,4 +720,210 @@ export function closeStorage(): void {
   database = null;
   masterKey = null;
   initialized = false;
+}
+
+// ============================================
+// PRODUCT FUNCTIONS
+// ============================================
+
+function mapProductRow(row: RawRow): ProductRecord {
+  return {
+    id: row.id as string,
+    walletNickname: row.wallet_nickname as string,
+    name: row.name as string,
+    priceSats: Number(row.price_sats) || 0,
+    description: row.description ?? undefined,
+    active: Boolean(row.active),
+    metadata: parseJSON<Record<string, unknown>>(row.metadata ?? null),
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+export function createProduct(params: CreateProductParams): ProductRecord {
+  ensureInitialized();
+  const db = requireDatabase();
+  const id = randomBytes(16).toString("hex");
+  const createdAt = nowISO();
+  const metadataJson = serializeJSON(params.metadata);
+
+  db.prepare(
+    `INSERT INTO products (
+      id, wallet_nickname, name, price_sats, description, active, metadata, created_at, updated_at
+    ) VALUES (
+      $id, $wallet_nickname, $name, $price_sats, $description, 1, $metadata, $created_at, $created_at
+    )`
+  ).run({
+    $id: id,
+    $wallet_nickname: params.walletNickname,
+    $name: params.name,
+    $price_sats: params.priceSats,
+    $description: params.description ?? null,
+    $metadata: metadataJson,
+    $created_at: createdAt,
+  });
+
+  return getProductById(id)!;
+}
+
+export function getProductById(id: string): ProductRecord | undefined {
+  ensureInitialized();
+  const db = requireDatabase();
+  const row = db.prepare(`SELECT * FROM products WHERE id = $id`).get({ $id: id }) as RawRow | undefined;
+  return row ? mapProductRow(row) : undefined;
+}
+
+export function listProducts(walletNickname: string, includeInactive = false): ProductRecord[] {
+  ensureInitialized();
+  const db = requireDatabase();
+  const query = includeInactive
+    ? `SELECT * FROM products WHERE wallet_nickname = $wallet_nickname ORDER BY created_at`
+    : `SELECT * FROM products WHERE wallet_nickname = $wallet_nickname AND active = 1 ORDER BY created_at`;
+  const rows = db.prepare(query).all({ $wallet_nickname: walletNickname }) as RawRow[];
+  return rows.map(mapProductRow);
+}
+
+export function updateProduct(
+  id: string,
+  updates: { name?: string; priceSats?: number; description?: string; active?: boolean; metadata?: Record<string, unknown> }
+): ProductRecord | undefined {
+  ensureInitialized();
+  const db = requireDatabase();
+  const product = getProductById(id);
+  if (!product) return undefined;
+
+  const newName = updates.name ?? product.name;
+  const newPriceSats = updates.priceSats ?? product.priceSats;
+  const newDescription = updates.description !== undefined ? updates.description : product.description;
+  const newActive = updates.active !== undefined ? updates.active : product.active;
+  const newMetadata = updates.metadata !== undefined ? updates.metadata : product.metadata;
+  const updatedAt = nowISO();
+
+  db.prepare(
+    `UPDATE products SET
+      name = $name,
+      price_sats = $price_sats,
+      description = $description,
+      active = $active,
+      metadata = $metadata,
+      updated_at = $updated_at
+    WHERE id = $id`
+  ).run({
+    $id: id,
+    $name: newName,
+    $price_sats: newPriceSats,
+    $description: newDescription ?? null,
+    $active: newActive ? 1 : 0,
+    $metadata: serializeJSON(newMetadata),
+    $updated_at: updatedAt,
+  });
+
+  return getProductById(id);
+}
+
+export function deleteProduct(id: string): void {
+  ensureInitialized();
+  const db = requireDatabase();
+  db.prepare(`DELETE FROM products WHERE id = $id`).run({ $id: id });
+}
+
+// ============================================
+// ORDER FUNCTIONS
+// ============================================
+
+function mapOrderRow(row: RawRow): OrderRecord {
+  return {
+    id: row.id as string,
+    walletNickname: row.wallet_nickname as string,
+    productId: row.product_id as string,
+    quantity: Number(row.quantity) || 1,
+    totalSats: Number(row.total_sats) || 0,
+    status: row.status as OrderStatus,
+    invoice: row.invoice ?? undefined,
+    paymentHash: row.payment_hash ?? undefined,
+    expiresAt: row.expires_at ? Number(row.expires_at) : undefined,
+    paidAt: row.paid_at ?? undefined,
+    metadata: parseJSON<Record<string, unknown>>(row.metadata ?? null),
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+export function createOrder(params: CreateOrderParams): OrderRecord {
+  ensureInitialized();
+  const db = requireDatabase();
+  const id = randomBytes(16).toString("hex");
+  const createdAt = nowISO();
+  const metadataJson = serializeJSON(params.metadata);
+
+  db.prepare(
+    `INSERT INTO orders (
+      id, wallet_nickname, product_id, quantity, total_sats, status, invoice, payment_hash, expires_at, metadata, created_at, updated_at
+    ) VALUES (
+      $id, $wallet_nickname, $product_id, $quantity, $total_sats, 'pending', $invoice, $payment_hash, $expires_at, $metadata, $created_at, $created_at
+    )`
+  ).run({
+    $id: id,
+    $wallet_nickname: params.walletNickname,
+    $product_id: params.productId,
+    $quantity: params.quantity,
+    $total_sats: params.totalSats,
+    $invoice: params.invoice,
+    $payment_hash: params.paymentHash,
+    $expires_at: params.expiresAt ?? null,
+    $metadata: metadataJson,
+    $created_at: createdAt,
+  });
+
+  return getOrderById(id)!;
+}
+
+export function getOrderById(id: string): OrderRecord | undefined {
+  ensureInitialized();
+  const db = requireDatabase();
+  const row = db.prepare(`SELECT * FROM orders WHERE id = $id`).get({ $id: id }) as RawRow | undefined;
+  return row ? mapOrderRow(row) : undefined;
+}
+
+export function getOrderByPaymentHash(paymentHash: string): OrderRecord | undefined {
+  ensureInitialized();
+  const db = requireDatabase();
+  const row = db.prepare(`SELECT * FROM orders WHERE payment_hash = $payment_hash`).get({ $payment_hash: paymentHash }) as RawRow | undefined;
+  return row ? mapOrderRow(row) : undefined;
+}
+
+export function updateOrderStatus(id: string, status: OrderStatus, paidAt?: string): OrderRecord | undefined {
+  ensureInitialized();
+  const db = requireDatabase();
+  const order = getOrderById(id);
+  if (!order) return undefined;
+
+  const updatedAt = nowISO();
+  db.prepare(
+    `UPDATE orders SET status = $status, paid_at = $paid_at, updated_at = $updated_at WHERE id = $id`
+  ).run({
+    $id: id,
+    $status: status,
+    $paid_at: paidAt ?? null,
+    $updated_at: updatedAt,
+  });
+
+  return getOrderById(id);
+}
+
+export function listOrders(walletNickname: string, status?: OrderStatus): OrderRecord[] {
+  ensureInitialized();
+  const db = requireDatabase();
+  const query = status
+    ? `SELECT * FROM orders WHERE wallet_nickname = $wallet_nickname AND status = $status ORDER BY created_at DESC`
+    : `SELECT * FROM orders WHERE wallet_nickname = $wallet_nickname ORDER BY created_at DESC`;
+  const rows = db.prepare(query).all({ $wallet_nickname: walletNickname, $status: status ?? null }) as RawRow[];
+  return rows.map(mapOrderRow);
+}
+
+export function findPendingOrderByInvoice(invoice: string): OrderRecord | undefined {
+  ensureInitialized();
+  const db = requireDatabase();
+  const row = db.prepare(`SELECT * FROM orders WHERE invoice = $invoice AND status = 'pending'`).get({ $invoice: invoice }) as RawRow | undefined;
+  return row ? mapOrderRow(row) : undefined;
 }

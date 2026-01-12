@@ -32,6 +32,15 @@ import {
   touchSubAccount,
 } from "./utils/nwc-store";
 import { parseBolt11 } from "applesauce-core/helpers";
+import {
+  initStorage,
+  createProduct,
+  getProductById,
+  listProducts,
+  updateProduct,
+  deleteProduct,
+} from "./utils/storage";
+import type { ProductRecord } from "./utils/storage";
 
 const MSATS_PER_SAT = 1000;
 const PAY_TIMEOUT_MS = Number(process.env.PAY_TIMEOUT_MS || "60000");
@@ -491,6 +500,222 @@ function describeContext(entry: NwcEntry | undefined, nickname: string, subId: s
   return `${sub.label} (${formatSubAccountIdentifier(nickname, subId)}) | balance: ${balance}${pending}`;
 }
 
+// ============================================
+// PRODUCT MANAGEMENT
+// ============================================
+
+let storageInitialized = false;
+
+function ensureStorageInitialized(): boolean {
+  if (storageInitialized) return true;
+  try {
+    if (process.env.STORAGE_MASTER_KEY || process.env.NWC_STORAGE_KEY) {
+      initStorage();
+      storageInitialized = true;
+      return true;
+    }
+    println("Storage not configured. Set STORAGE_MASTER_KEY to use product management.");
+    return false;
+  } catch (e: any) {
+    println(`Storage initialization failed: ${e?.message || String(e)}`);
+    return false;
+  }
+}
+
+async function manageProducts(nickname: string): Promise<void> {
+  if (!ensureStorageInitialized()) return;
+
+  while (true) {
+    println("");
+    let products: ProductRecord[];
+    try {
+      products = listProducts(nickname);
+    } catch (e: any) {
+      println(`Failed to list products: ${e?.message || String(e)}`);
+      return;
+    }
+
+    if (products.length === 0) {
+      println(`No products for wallet '${nickname}'.`);
+    } else {
+      println(`Products for wallet '${nickname}':`);
+      products.forEach((p, idx) => {
+        const status = p.active ? "" : " [inactive]";
+        println(`${idx + 1}. ${p.name} @ ${p.priceSats} sats${status} (${p.id.slice(0, 8)}...)`);
+      });
+    }
+
+    const choices = [
+      ...products.map((p) => ({ label: `Edit '${p.name}'`, value: p.id })),
+      { label: "+ Add product", value: "__add" },
+      { label: "Back", value: "__back" },
+    ];
+
+    const selection = await promptSelect("Choose an action:", choices);
+
+    if (selection === "__back") return;
+
+    if (selection === "__add") {
+      await addProduct(nickname);
+      continue;
+    }
+
+    // Edit selected product
+    await editProduct(selection);
+  }
+}
+
+async function addProduct(nickname: string): Promise<void> {
+  let name = "";
+  while (!name) {
+    name = (await prompt("Product name:"))?.trim() || "";
+    if (!name) println("Name cannot be empty.");
+  }
+
+  let priceSats: number | null = null;
+  while (!priceSats || priceSats <= 0) {
+    priceSats = await promptNumber("Price in sats:");
+    if (!priceSats || priceSats <= 0) println("Price must be a positive number.");
+  }
+
+  const description = (await prompt("Description (optional):"))?.trim() || undefined;
+
+  try {
+    const product = createProduct({
+      walletNickname: nickname,
+      name,
+      priceSats: Math.floor(priceSats),
+      description,
+    });
+    println(`Product created: ${product.name} @ ${product.priceSats} sats (ID: ${product.id})`);
+  } catch (e: any) {
+    println(`Failed to create product: ${e?.message || String(e)}`);
+  }
+}
+
+async function editProduct(productId: string): Promise<void> {
+  let product: ProductRecord | undefined;
+  try {
+    product = getProductById(productId);
+  } catch (e: any) {
+    println(`Failed to get product: ${e?.message || String(e)}`);
+    return;
+  }
+
+  if (!product) {
+    println("Product not found.");
+    return;
+  }
+
+  while (true) {
+    println("");
+    println(`Product: ${product.name}`);
+    println(`Price: ${product.priceSats} sats`);
+    println(`Description: ${product.description || "(none)"}`);
+    println(`Status: ${product.active ? "Active" : "Inactive"}`);
+    println(`ID: ${product.id}`);
+
+    const choice = await promptSelect("Select action:", [
+      { label: "Rename", value: "rename" },
+      { label: "Change price", value: "price" },
+      { label: "Update description", value: "description" },
+      { label: product.active ? "Deactivate" : "Activate", value: "toggle" },
+      { label: "Generate CURL", value: "curl" },
+      { label: "Delete", value: "delete" },
+      { label: "Back", value: "__back" },
+    ]);
+
+    if (choice === "__back") return;
+
+    if (choice === "rename") {
+      const newName = (await prompt("New name:"))?.trim();
+      if (!newName) {
+        println("Name unchanged.");
+      } else {
+        product = updateProduct(productId, { name: newName });
+        if (product) println("Name updated.");
+      }
+      continue;
+    }
+
+    if (choice === "price") {
+      const newPrice = await promptNumber("New price (sats):");
+      if (!newPrice || newPrice <= 0) {
+        println("Price unchanged.");
+      } else {
+        product = updateProduct(productId, { priceSats: Math.floor(newPrice) });
+        if (product) println("Price updated.");
+      }
+      continue;
+    }
+
+    if (choice === "description") {
+      const newDesc = (await prompt("New description (blank to clear):"))?.trim();
+      product = updateProduct(productId, { description: newDesc || undefined });
+      if (product) println("Description updated.");
+      continue;
+    }
+
+    if (choice === "toggle") {
+      product = updateProduct(productId, { active: !product.active });
+      if (product) println(`Product is now ${product.active ? "active" : "inactive"}.`);
+      continue;
+    }
+
+    if (choice === "curl") {
+      const port = Bun.env.PORT || "8787";
+      const host = Bun.env.API_HOST || `http://localhost:${port}`;
+      const authToken = Bun.env.AUTH_API;
+
+      println("");
+      println("=== CURL Commands ===");
+      println("");
+      println("1. Get product details:");
+      if (authToken) {
+        println(`curl -X GET "${host}/api/products/${product.id}" \\`);
+        println(`  -H "Authorization: Bearer ${authToken}"`);
+      } else {
+        println(`curl -X GET "${host}/api/products/${product.id}"`);
+      }
+      println("");
+      println("2. Create order (generates invoice):");
+      println(`curl -X POST "${host}/api/orders" \\`);
+      if (authToken) {
+        println(`  -H "Content-Type: application/json" \\`);
+        println(`  -H "Authorization: Bearer ${authToken}" \\`);
+      } else {
+        println(`  -H "Content-Type: application/json" \\`);
+      }
+      println(`  -d '{"product_id": "${product.id}", "quantity": 1}'`);
+      println("");
+      println("3. Check order status (replace ORDER_ID with id from step 2):");
+      if (authToken) {
+        println(`curl -X GET "${host}/api/orders/ORDER_ID/status" \\`);
+        println(`  -H "Authorization: Bearer ${authToken}"`);
+      } else {
+        println(`curl -X GET "${host}/api/orders/ORDER_ID/status"`);
+      }
+      println("");
+      continue;
+    }
+
+    if (choice === "delete") {
+      const confirm = (await prompt("Type DELETE to remove this product:"))?.trim();
+      if (confirm !== "DELETE") {
+        println("Deletion aborted.");
+        continue;
+      }
+      try {
+        deleteProduct(productId);
+        println("Product deleted.");
+        return;
+      } catch (e: any) {
+        println(`Failed to delete product: ${e?.message || String(e)}`);
+      }
+    }
+  }
+}
+
 function recordSubAccountUsage(
   store: NwcStore,
   nickname: string,
@@ -655,6 +880,7 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
     }
 
     menuItems.push({ value: "manage_subaccounts", label: "Manage sub-accounts" });
+    menuItems.push({ value: "manage_products", label: "Manage products" });
     menuItems.push({ value: "switch_wallet", label: "Switch wallet" });
     menuItems.push({ value: "quit", label: "Quit" });
 
@@ -689,6 +915,10 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
             const updatedLabel = describeContext(entry, nickname, activeSubAccountId);
             println(`Now operating as: ${updatedLabel}`);
           }
+          break;
+        }
+        case "manage_products": {
+          await manageProducts(nickname);
           break;
         }
         case "get_balance": {
